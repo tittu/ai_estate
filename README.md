@@ -1,5 +1,7 @@
 AI Estate Management & Governance Platform with three pillars:
+
 Discover → Observe → Govern
+
              AI ESTATE
                  │
      ┌───────────┼───────────┐
