@@ -63,6 +63,18 @@ Establish enterprise-wide controls, policies, and lifecycle management.
 
 ---
 
+## Project Structure
+
+* `ai-estate-collector/` — Data collection services
+* `ai-estate-api/` — API layer
+* `ai-estate-catalog/` — Catalog service
+* `ai-estate-runtime/` — Runtime engine
+* `ai-estate-governance/` — Governance and policy services
+* `ai-estate-ui/` — Frontend UI
+* `docs/` — Documentation
+
+---
+
 ## Vision
 
 > **Know every AI asset, understand every dependency, observe every AI interaction, and govern the entire AI estate from a single platform.**

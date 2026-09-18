@@ -1,0 +1,1710 @@
+Yes. For **AI Estate**, I would explicitly separate the database into two logical layers:
+
+1. **AI Asset / Estate Catalog** — relatively stable, continuously updated information about *what exists* and *how components are mapped*.
+2. **AI Runtime / Usage Telemetry** — high-volume, append-heavy information about *what happened for every request*.
+
+This separation is important because the characteristics are very different. The catalog needs strong relationships, versioning and governance; runtime data needs high write throughput, time-based partitioning and aggregation.
+
+---
+
+# AI Estate — Database Design
+
+```text
+                         AI ESTATE
+                            │
+             ┌──────────────┴──────────────┐
+             │                             │
+       1. ESTATE CATALOG             2. RUNTIME TELEMETRY
+             │                             │
+       "What exists?"                "What happened?"
+             │                             │
+     ┌───────┼────────┐          ┌─────────┼─────────┐
+     │       │        │          │         │         │
+  Assets  Mappings  Governance  Requests  Traces   Metrics
+     │       │        │          │         │         │
+     └───────┼────────┘          └─────────┼─────────┘
+             │                             │
+             └──────────────┬──────────────┘
+                            │
+                     AI ESTATE GRAPH
+```
+
+I would use **PostgreSQL as the system of record** initially.
+
+For large-scale telemetry, I'd eventually add **ClickHouse** or another analytical/time-series store rather than forcing PostgreSQL to handle billions of request records.
+
+---
+
+# 1. Core Domain Model
+
+The most important concept is that an **AI Asset** is not the same thing as a runtime request.
+
+For example:
+
+```text
+Application
+   │
+   └── Agent
+         │
+         ├── LLM
+         │     └── OpenAI GPT-X
+         │
+         ├── Embedding
+         │     └── text-embedding-X
+         │
+         ├── Reranker
+         │     └── Cohere Rerank-X
+         │
+         ├── Tool
+         │     └── Salesforce
+         │
+         ├── MCP Server
+         │     └── Jira MCP
+         │
+         └── Vector DB
+               └── Pinecone
+```
+
+Then runtime:
+
+```text
+Application
+     │
+     ▼
+Request #12345
+     │
+     ├── Agent invocation
+     │
+     ├── LLM call
+     │
+     ├── Tool call
+     │
+     ├── Embedding call
+     │
+     ├── Vector search
+     │
+     ├── Reranker call
+     │
+     └── Final response
+```
+
+The **catalog tells you what the relationship is**.
+
+The **runtime layer tells you that the relationship was actually used**.
+
+---
+
+# 2. Database Domains
+
+I'd organize the schema into these logical domains:
+
+```text
+ai_estate
+│
+├── Organization
+│   ├── Tenant
+│   ├── Business Unit
+│   ├── Team
+│   └── User
+│
+├── Application Catalog
+│   ├── Application
+│   ├── Environment
+│   └── Deployment
+│
+├── AI Asset Catalog
+│   ├── Agent
+│   ├── Workflow
+│   ├── Tool
+│   ├── MCP Server
+│   ├── Model
+│   ├── Vector Store
+│   ├── Knowledge Source
+│   └── Prompt
+│
+├── Technology Catalog
+│   ├── Provider
+│   ├── Framework
+│   ├── Technology
+│   └── Technology Version
+│
+├── Relationships
+│   └── Asset Relationships
+│
+├── Governance
+│   ├── Policy
+│   ├── Policy Assignment
+│   ├── Risk
+│   ├── Compliance
+│   └── Ownership
+│
+└── Runtime
+    ├── Request
+    ├── Trace
+    ├── Span
+    ├── Model Invocation
+    ├── Tool Invocation
+    ├── Embedding Invocation
+    ├── Retrieval Invocation
+    └── Usage Metrics
+```
+
+---
+
+# 3. Organization Tables
+
+These establish ownership and organizational hierarchy.
+
+### `tenant`
+
+```sql
+CREATE TABLE tenant (
+    tenant_id       UUID PRIMARY KEY,
+    name            VARCHAR(255) NOT NULL,
+    description     TEXT,
+    status          VARCHAR(50) NOT NULL,
+    created_at      TIMESTAMP NOT NULL,
+    updated_at      TIMESTAMP NOT NULL
+);
+```
+
+### `business_unit`
+
+```sql
+CREATE TABLE business_unit (
+    business_unit_id UUID PRIMARY KEY,
+    tenant_id        UUID NOT NULL REFERENCES tenant(tenant_id),
+    name             VARCHAR(255) NOT NULL,
+    description      TEXT,
+    created_at       TIMESTAMP NOT NULL,
+    updated_at       TIMESTAMP NOT NULL
+);
+```
+
+### `team`
+
+```sql
+CREATE TABLE team (
+    team_id          UUID PRIMARY KEY,
+    business_unit_id UUID REFERENCES business_unit(business_unit_id),
+    name             VARCHAR(255) NOT NULL,
+    description      TEXT,
+    created_at       TIMESTAMP NOT NULL,
+    updated_at       TIMESTAMP NOT NULL
+);
+```
+
+---
+
+# 4. Application
+
+An **Application** is the top-level entity consuming AI capabilities.
+
+```sql
+CREATE TABLE application (
+    application_id   UUID PRIMARY KEY,
+    tenant_id        UUID NOT NULL REFERENCES tenant(tenant_id),
+    team_id          UUID REFERENCES team(team_id),
+
+    name             VARCHAR(255) NOT NULL,
+    description      TEXT,
+
+    application_type VARCHAR(100),
+    criticality      VARCHAR(50),
+
+    lifecycle_status VARCHAR(50),
+
+    repository_url   TEXT,
+
+    created_at       TIMESTAMP NOT NULL,
+    updated_at       TIMESTAMP NOT NULL
+);
+```
+
+Example:
+
+```text
+Application
+------------------------------
+Content Aviator
+Customer Support AI
+Contract Analyzer
+HR Assistant
+```
+
+---
+
+# 5. Environment
+
+An application can exist in multiple environments.
+
+```sql
+CREATE TABLE environment (
+    environment_id UUID PRIMARY KEY,
+    application_id UUID NOT NULL REFERENCES application(application_id),
+
+    name           VARCHAR(50) NOT NULL,
+    -- DEV / QA / STAGING / PROD
+
+    cluster_name   VARCHAR(255),
+    namespace      VARCHAR(255),
+
+    created_at     TIMESTAMP NOT NULL,
+    updated_at     TIMESTAMP NOT NULL
+);
+```
+
+So:
+
+```text
+Content Aviator
+│
+├── DEV
+├── QA
+├── STAGING
+└── PROD
+```
+
+---
+
+# 6. AI Asset — Most Important Table
+
+I would **not create completely independent root tables for every type of asset**.
+
+Instead, create a common `asset` table.
+
+```sql
+CREATE TABLE asset (
+    asset_id        UUID PRIMARY KEY,
+
+    tenant_id       UUID NOT NULL REFERENCES tenant(tenant_id),
+
+    asset_type      VARCHAR(50) NOT NULL,
+    -- AGENT
+    -- WORKFLOW
+    -- TOOL
+    -- MCP_SERVER
+    -- MCP_TOOL
+    -- MODEL
+    -- VECTOR_STORE
+    -- KNOWLEDGE_SOURCE
+    -- PROMPT
+    -- RERANKER
+
+    name            VARCHAR(255) NOT NULL,
+    description     TEXT,
+
+    provider        VARCHAR(255),
+
+    lifecycle_status VARCHAR(50),
+
+    environment_id  UUID REFERENCES environment(environment_id),
+
+    owner_team_id   UUID REFERENCES team(team_id),
+
+    metadata        JSONB,
+
+    created_at      TIMESTAMP NOT NULL,
+    updated_at      TIMESTAMP NOT NULL
+);
+```
+
+This gives you a universal asset registry.
+
+Example:
+
+```text
+asset_id       asset_type        name
+------------------------------------------------
+A001           AGENT             Contract Agent
+A002           MODEL             GPT-X
+A003           MODEL             text-embedding-X
+A004           TOOL              Salesforce
+A005           MCP_SERVER        Jira MCP
+A006           VECTOR_STORE      Pinecone
+A007           PROMPT            Contract Summary Prompt
+```
+
+---
+
+# 7. Model Catalog
+
+Models deserve additional structured information.
+
+```sql
+CREATE TABLE model (
+    model_id             UUID PRIMARY KEY,
+    asset_id             UUID UNIQUE NOT NULL REFERENCES asset(asset_id),
+
+    model_type           VARCHAR(50) NOT NULL,
+    -- LLM
+    -- EMBEDDING
+    -- RERANKER
+    -- VISION
+    -- MULTIMODAL
+
+    provider             VARCHAR(255),
+
+    model_name           VARCHAR(255),
+
+    model_version        VARCHAR(100),
+
+    context_window       INTEGER,
+
+    input_price          NUMERIC(18,8),
+    output_price         NUMERIC(18,8),
+
+    currency             VARCHAR(10),
+
+    release_date         DATE,
+    deprecation_date     DATE,
+    retirement_date      DATE,
+
+    status               VARCHAR(50),
+
+    metadata             JSONB,
+
+    created_at           TIMESTAMP NOT NULL,
+    updated_at           TIMESTAMP NOT NULL
+);
+```
+
+This is where your **continuously updated component information** comes in.
+
+For example:
+
+```text
+GPT-X
+│
+├── Provider: OpenAI
+├── Type: LLM
+├── Context Window: ...
+├── Input Cost: ...
+├── Output Cost: ...
+├── Release Date
+├── Deprecation Date
+├── Retirement Date
+└── Status
+```
+
+---
+
+# 8. Technology / Framework Catalog
+
+This is useful for the LeanIX-like side of your product.
+
+```sql
+CREATE TABLE technology (
+    technology_id    UUID PRIMARY KEY,
+
+    name             VARCHAR(255) NOT NULL,
+    category         VARCHAR(100),
+    -- FRAMEWORK
+    -- DATABASE
+    -- LANGUAGE
+    -- LIBRARY
+    -- INFRASTRUCTURE
+
+    vendor           VARCHAR(255),
+
+    description      TEXT,
+
+    created_at       TIMESTAMP NOT NULL,
+    updated_at       TIMESTAMP NOT NULL
+);
+```
+
+And:
+
+```sql
+CREATE TABLE technology_version (
+    technology_version_id UUID PRIMARY KEY,
+
+    technology_id         UUID NOT NULL
+                           REFERENCES technology(technology_id),
+
+    version               VARCHAR(100),
+
+    release_date          DATE,
+    end_of_support        DATE,
+    end_of_life           DATE,
+
+    risk_level            VARCHAR(50),
+
+    created_at            TIMESTAMP NOT NULL,
+    updated_at            TIMESTAMP NOT NULL
+);
+```
+
+This allows:
+
+```text
+LangGraph
+│
+├── 1.x
+├── 2.x
+└── 3.x
+
+Python
+│
+├── 3.10
+├── 3.11
+├── 3.12
+└── 3.13
+```
+
+---
+
+# 9. Asset Relationships
+
+This is **the heart of AI Estate**.
+
+Don't hardcode relationships such as:
+
+```text
+agent → model
+agent → tool
+```
+
+Instead create a generic relationship table.
+
+```sql
+CREATE TABLE asset_relationship (
+    relationship_id UUID PRIMARY KEY,
+
+    source_asset_id UUID NOT NULL REFERENCES asset(asset_id),
+    target_asset_id UUID NOT NULL REFERENCES asset(asset_id),
+
+    relationship_type VARCHAR(100) NOT NULL,
+
+    environment_id UUID REFERENCES environment(environment_id),
+
+    valid_from TIMESTAMP,
+    valid_to   TIMESTAMP,
+
+    metadata JSONB,
+
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL
+);
+```
+
+Examples:
+
+```text
+Contract Agent
+     │
+     ├── USES ──────────► GPT-X
+     │
+     ├── USES ──────────► Embedding-X
+     │
+     ├── CALLS ─────────► Salesforce
+     │
+     └── USES ──────────► Contract MCP
+```
+
+This table allows the architecture to evolve without database changes.
+
+---
+
+# 10. Versioned Mapping
+
+This is important.
+
+Suppose today:
+
+```text
+Agent A → GPT-X
+```
+
+and next month:
+
+```text
+Agent A → GPT-Y
+```
+
+You don't want to lose the historical relationship.
+
+Therefore:
+
+```text
+Agent A
+│
+├── GPT-X
+│     valid: Jan → Jun
+│
+└── GPT-Y
+      valid: Jun → present
+```
+
+The `valid_from` / `valid_to` fields allow you to reconstruct the estate at any point in time.
+
+This becomes very powerful for questions like:
+
+> What model was Application X using when this request happened?
+
+---
+
+# 11. Runtime Request
+
+Now we move to your second layer.
+
+```sql
+CREATE TABLE ai_request (
+    request_id       UUID PRIMARY KEY,
+
+    tenant_id        UUID NOT NULL,
+
+    application_id   UUID,
+    environment_id   UUID,
+
+    external_request_id VARCHAR(255),
+
+    request_type     VARCHAR(100),
+
+    user_id_hash     VARCHAR(255),
+
+    started_at       TIMESTAMP NOT NULL,
+    completed_at     TIMESTAMP,
+
+    status           VARCHAR(50),
+
+    total_latency_ms BIGINT,
+
+    total_cost       NUMERIC(18,8),
+
+    trace_id         UUID,
+
+    metadata         JSONB
+);
+```
+
+Example:
+
+```text
+Request
+--------------------------------
+request_id: 12345
+application: Contract Analyzer
+environment: PROD
+
+started: 10:00:01
+completed: 10:00:04
+
+latency: 3.2 sec
+cost: $0.08
+
+trace: abc123
+```
+
+---
+
+# 12. Trace
+
+One request can contain multiple operations.
+
+```sql
+CREATE TABLE ai_trace (
+    trace_id        UUID PRIMARY KEY,
+
+    request_id      UUID NOT NULL,
+
+    root_span_id    UUID,
+
+    started_at      TIMESTAMP NOT NULL,
+    completed_at    TIMESTAMP,
+
+    status          VARCHAR(50),
+
+    metadata        JSONB
+);
+```
+
+---
+
+# 13. Span
+
+This represents individual operations.
+
+```sql
+CREATE TABLE ai_span (
+    span_id          UUID PRIMARY KEY,
+
+    trace_id         UUID NOT NULL,
+
+    parent_span_id   UUID,
+
+    application_id   UUID,
+
+    asset_id         UUID,
+
+    span_type        VARCHAR(50),
+
+    -- AGENT
+    -- LLM
+    -- EMBEDDING
+    -- RERANKER
+    -- TOOL
+    -- MCP
+    -- RETRIEVAL
+
+    started_at       TIMESTAMP NOT NULL,
+    completed_at     TIMESTAMP,
+
+    latency_ms       BIGINT,
+
+    status           VARCHAR(50),
+
+    metadata         JSONB
+);
+```
+
+This is the bridge between **catalog** and **runtime**.
+
+For example:
+
+```text
+Span
+│
+├── asset_id = GPT-X
+├── span_type = LLM
+├── latency = 1200ms
+└── status = SUCCESS
+```
+
+The `asset_id` points back to the catalog.
+
+---
+
+# 14. LLM Invocation
+
+Don't put every model-specific field directly into `ai_span`.
+
+Create specialized tables.
+
+```sql
+CREATE TABLE llm_invocation (
+    span_id              UUID PRIMARY KEY REFERENCES ai_span(span_id),
+
+    model_id              UUID NOT NULL REFERENCES model(model_id),
+
+    provider_request_id   VARCHAR(255),
+
+    input_tokens          INTEGER,
+    output_tokens         INTEGER,
+    total_tokens          INTEGER,
+
+    cached_tokens         INTEGER,
+
+    temperature           NUMERIC(5,4),
+
+    input_cost            NUMERIC(18,8),
+    output_cost           NUMERIC(18,8),
+    total_cost            NUMERIC(18,8),
+
+    finish_reason         VARCHAR(100),
+
+    metadata              JSONB
+);
+```
+
+---
+
+# 15. Embedding Invocation
+
+```sql
+CREATE TABLE embedding_invocation (
+    span_id          UUID PRIMARY KEY REFERENCES ai_span(span_id),
+
+    model_id         UUID NOT NULL REFERENCES model(model_id),
+
+    input_count      INTEGER,
+
+    input_tokens     INTEGER,
+
+    dimensions       INTEGER,
+
+    total_cost       NUMERIC(18,8),
+
+    metadata         JSONB
+);
+```
+
+---
+
+# 16. Tool Invocation
+
+```sql
+CREATE TABLE tool_invocation (
+    span_id          UUID PRIMARY KEY REFERENCES ai_span(span_id),
+
+    tool_asset_id    UUID NOT NULL REFERENCES asset(asset_id),
+
+    operation_name   VARCHAR(255),
+
+    request_size     INTEGER,
+    response_size    INTEGER,
+
+    status_code      INTEGER,
+
+    total_cost       NUMERIC(18,8),
+
+    metadata         JSONB
+);
+```
+
+---
+
+# 17. Retrieval Invocation
+
+For RAG:
+
+```sql
+CREATE TABLE retrieval_invocation (
+    span_id              UUID PRIMARY KEY REFERENCES ai_span(span_id),
+
+    vector_store_asset_id UUID REFERENCES asset(asset_id),
+
+    query_count           INTEGER,
+
+    top_k                 INTEGER,
+
+    result_count          INTEGER,
+
+    retrieval_latency_ms  BIGINT,
+
+    metadata              JSONB
+);
+```
+
+---
+
+# 18. Request → Trace → Span Architecture
+
+This gives you:
+
+```text
+AI REQUEST
+│
+└── TRACE
+     │
+     ├── AGENT SPAN
+     │    │
+     │    ├── LLM SPAN
+     │    │    └── LLM Invocation
+     │    │
+     │    ├── TOOL SPAN
+     │    │    └── Tool Invocation
+     │    │
+     │    └── LLM SPAN
+     │         └── LLM Invocation
+     │
+     └── RAG SPAN
+          │
+          ├── EMBEDDING SPAN
+          │
+          ├── RETRIEVAL SPAN
+          │
+          └── RERANKER SPAN
+```
+
+This is essentially the runtime graph of an AI application.
+
+---
+
+# 19. Governance
+
+### Policy
+
+```sql
+CREATE TABLE policy (
+    policy_id       UUID PRIMARY KEY,
+
+    tenant_id       UUID NOT NULL,
+
+    name            VARCHAR(255),
+
+    policy_type     VARCHAR(100),
+
+    description     TEXT,
+
+    severity        VARCHAR(50),
+
+    rule_definition JSONB,
+
+    status          VARCHAR(50),
+
+    created_at      TIMESTAMP,
+    updated_at      TIMESTAMP
+);
+```
+
+Example:
+
+```json
+{
+  "rule": "model.provider",
+  "operator": "NOT_IN",
+  "value": ["approved-provider"]
+}
+```
+
+---
+
+# 20. Policy Violation
+
+```sql
+CREATE TABLE policy_violation (
+    violation_id    UUID PRIMARY KEY,
+
+    policy_id       UUID REFERENCES policy(policy_id),
+
+    asset_id        UUID REFERENCES asset(asset_id),
+
+    request_id      UUID REFERENCES ai_request(request_id),
+
+    detected_at     TIMESTAMP,
+
+    severity        VARCHAR(50),
+
+    status          VARCHAR(50),
+
+    details         JSONB
+);
+```
+
+Now you can detect:
+
+```text
+GPT model not approved
+        ↓
+Agent
+        ↓
+Policy violation
+        ↓
+Governance dashboard
+```
+
+---
+
+# 21. Risk
+
+```sql
+CREATE TABLE asset_risk (
+    risk_id         UUID PRIMARY KEY,
+
+    asset_id        UUID NOT NULL REFERENCES asset(asset_id),
+
+    risk_type       VARCHAR(100),
+
+    severity        VARCHAR(50),
+
+    score            NUMERIC(10,4),
+
+    reason           TEXT,
+
+    detected_at      TIMESTAMP,
+
+    resolved_at      TIMESTAMP,
+
+    metadata         JSONB
+);
+```
+
+Potential risks:
+
+```text
+MODEL_DEPRECATED
+MODEL_UNAPPROVED
+HIGH_COST
+HIGH_LATENCY
+SECURITY
+COMPLIANCE
+NO_OWNER
+NO_TRACING
+OUTDATED_VERSION
+```
+
+---
+
+# 22. Ownership
+
+Ownership shouldn't only live directly on `asset`.
+
+Eventually you may have multiple owners.
+
+```sql
+CREATE TABLE asset_owner (
+    asset_id        UUID REFERENCES asset(asset_id),
+
+    team_id         UUID REFERENCES team(team_id),
+
+    owner_type      VARCHAR(50),
+
+    is_primary      BOOLEAN,
+
+    assigned_at     TIMESTAMP,
+
+    PRIMARY KEY(asset_id, team_id)
+);
+```
+
+---
+
+# 23. The Overall ER Model
+
+Conceptually:
+
+```text
+                         TENANT
+                           │
+               ┌───────────┴───────────┐
+               │                       │
+          BUSINESS UNIT             APPLICATION
+               │                       │
+              TEAM              ┌──────┴──────┐
+               │                │             │
+               │           ENVIRONMENT    ASSET
+               │                              │
+               │                         ┌────┴─────┐
+               │                         │          │
+               │                       MODEL    TOOL
+               │                         │          │
+               │                    MODEL INFO   ...
+               │
+               │
+               └──────────────────────┐
+                                      │
+                                 ASSET OWNER
+                                      │
+                                      ▼
+                                    ASSET
+                                      │
+                         ┌────────────┴────────────┐
+                         │                         │
+                ASSET RELATIONSHIP              RISK
+                         │
+                         │
+                  ┌──────┴───────┐
+                  │              │
+               ASSET A         ASSET B
+
+
+APPLICATION
+     │
+     ▼
+AI_REQUEST
+     │
+     ▼
+AI_TRACE
+     │
+     ▼
+AI_SPAN
+     │
+ ┌───┼─────────────┬────────────┐
+ │   │             │            │
+ ▼   ▼             ▼            ▼
+LLM TOOL       EMBEDDING    RETRIEVAL
+ │
+ ▼
+MODEL
+ │
+ ▼
+ASSET
+```
+
+---
+
+# 24. The Critical Relationship Between the Two Layers
+
+This is the part I would emphasize in your architecture.
+
+### Catalog
+
+```text
+AGENT
+  │
+  ├── USES → GPT-X
+  ├── USES → Embedding-X
+  ├── USES → Salesforce
+  └── USES → Pinecone
+```
+
+### Runtime
+
+```text
+REQUEST-123
+  │
+  ├── GPT-X              1 call
+  ├── Embedding-X        3 calls
+  ├── Salesforce         2 calls
+  └── Pinecone            3 calls
+```
+
+The connection is:
+
+```text
+                 ASSET
+                   ▲
+                   │
+             asset_id
+                   │
+                AI_SPAN
+                   ▲
+                   │
+               trace_id
+                   │
+               AI_TRACE
+                   ▲
+                   │
+              request_id
+                   │
+              AI_REQUEST
+```
+
+This means you can answer both **estate questions** and **runtime questions**.
+
+---
+
+# 25. Questions Your DB Should Support
+
+This model allows queries such as:
+
+### Estate
+
+> What AI agents exist?
+
+```text
+asset
+WHERE asset_type = 'AGENT'
+```
+
+### Dependency
+
+> Which agents use GPT-X?
+
+```text
+asset_relationship
+WHERE target_asset_id = GPT-X
+```
+
+### Runtime usage
+
+> How many times was GPT-X called today?
+
+```text
+ai_span
+WHERE asset_id = GPT-X
+AND span_type = 'LLM'
+```
+
+### Cost
+
+> Which team spent the most on LLMs?
+
+```text
+TEAM
+   ↓
+APPLICATION
+   ↓
+AI_REQUEST
+   ↓
+AI_SPAN
+   ↓
+LLM_INVOCATION
+```
+
+### Impact analysis
+
+> If GPT-X is deprecated, which applications are impacted?
+
+```text
+MODEL
+ ↓
+ASSET
+ ↓
+ASSET_RELATIONSHIP
+ ↓
+AGENT
+ ↓
+APPLICATION
+```
+
+### Governance
+
+> Which production agents are using unapproved models?
+
+```text
+ASSET
+ ↓
+RELATIONSHIP
+ ↓
+MODEL
+ ↓
+POLICY
+ ↓
+VIOLATION
+```
+
+---
+
+# 26. Don't Store Everything in PostgreSQL
+
+For the initial POC:
+
+```text
+                PostgreSQL
+                    │
+        ┌───────────┴───────────┐
+        │                       │
+    Catalog                  Runtime
+    Metadata                 Events
+```
+
+is perfectly reasonable.
+
+But at scale I'd evolve to:
+
+```text
+                    AI ESTATE
+                       │
+              ┌────────┴────────┐
+              │                 │
+         PostgreSQL          Kafka
+              │                 │
+         Catalog DB             │
+              │                 ▼
+              │            ClickHouse
+              │                 │
+              │          Runtime Analytics
+              │
+              ▼
+         Graph / Search
+       OpenSearch / Neo4j
+```
+
+I would **not introduce Neo4j immediately**. PostgreSQL's relationship tables can handle the initial dependency graph. Introduce a graph database only when multi-hop graph queries become a demonstrated bottleneck.
+
+Similarly, keep raw prompts/responses out of the primary relational tables unless required. Store them separately, with references from `ai_span`:
+
+```text
+AI_SPAN
+   │
+   └── payload_ref
+           │
+           ▼
+       Object Store
+       / Blob Store
+```
+
+This is especially important for enterprise privacy, retention, and cost.
+
+---
+
+# 27. One Additional Table I'd Strongly Recommend: `asset_snapshot`
+
+Because your first layer is **continuously maintaining current information**, you need to distinguish:
+
+> Current state
+
+from:
+
+> Historical state.
+
+For example, today:
+
+```text
+Agent A → GPT-X
+```
+
+tomorrow:
+
+```text
+Agent A → GPT-Y
+```
+
+Create:
+
+```sql
+CREATE TABLE asset_snapshot (
+    snapshot_id     UUID PRIMARY KEY,
+
+    asset_id        UUID NOT NULL REFERENCES asset(asset_id),
+
+    version         BIGINT NOT NULL,
+
+    snapshot_time   TIMESTAMP NOT NULL,
+
+    status          VARCHAR(50),
+
+    configuration   JSONB,
+
+    metadata        JSONB
+);
+```
+
+Now you have:
+
+```text
+Asset
+ │
+ ├── Snapshot v1
+ │     └── GPT-X
+ │
+ ├── Snapshot v2
+ │     └── GPT-Y
+ │
+ └── Snapshot v3
+       └── GPT-Z
+```
+
+This is extremely useful for **AI Estate lifecycle management**.
+
+---
+
+# 28. Recommended High-Level Architecture
+
+I'd therefore start your POC with:
+
+```text
+                         ┌───────────────────┐
+                         │    AI ESTATE UI   │
+                         └─────────┬─────────┘
+                                   │
+                         ┌─────────▼─────────┐
+                         │    Estate API     │
+                         └─────────┬─────────┘
+                                   │
+              ┌────────────────────┼────────────────────┐
+              │                    │                    │
+              ▼                    ▼                    ▼
+       Asset Catalog         Runtime API          Governance
+              │                    │                    │
+              ▼                    ▼                    ▼
+        PostgreSQL             Kafka/Events         Policy Engine
+              │                    │
+              │                    ▼
+              │               ClickHouse
+              │                    │
+              └──────────┬─────────┘
+                         │
+                  ┌──────▼───────┐
+                  │ AI ESTATE    │
+                  │ KNOWLEDGE    │
+                  │ GRAPH        │
+                  └──────────────┘
+```
+
+### And the key architectural principle should be:
+
+> **Catalog answers "What exists and how is it connected?"**
+> **Telemetry answers "What happened, when, how often, and at what cost?"**
+> **Governance answers "Is it allowed, compliant, secure, and properly owned?"**
+
+That gives you a clean foundation for your **Discover → Observe → Govern** model without coupling the product to LangGraph, LangChain, OpenAI, Google ADK, MCP, or any single AI framework.
+
+
+AI Estate Collector ->
+
+I agree. **AI Estate Collector** is a strong architectural concept because it makes the platform **agent/environment-centric rather than application-SDK-centric**.
+
+I'd make the Collector the foundation of the whole platform.
+
+## Proposed architecture
+
+```text
+                         ┌─────────────────────────┐
+                         │       AI ESTATE         │
+                         │        PLATFORM         │
+                         └────────────┬────────────┘
+                                      │
+                              ┌───────▼────────┐
+                              │  Estate Control │
+                              │     Plane       │
+                              └───────┬────────┘
+                                      │
+                         ┌────────────┼────────────┐
+                         │            │            │
+                         ▼            ▼            ▼
+                    Asset Catalog   Runtime      Governance
+                                   Analytics
+                         ▲            ▲
+                         │            │
+                  ┌──────┴────────────┴──────┐
+                  │     AI Estate Collector  │
+                  └─────────────┬────────────┘
+                                │
+        ┌───────────────────────┼────────────────────────┐
+        │                       │                        │
+        ▼                       ▼                        ▼
+   Kubernetes                 Cloud                    Git/CI
+        │                       │                        │
+   Pods/Deployments       Services/APIs          Repositories
+   ConfigMaps             Model endpoints        SBOM
+   Services               AI services            Dependencies
+        │                       │                        │
+        └───────────────────────┼────────────────────────┘
+                                │
+                         ┌──────▼───────┐
+                         │ AI Runtime   │
+                         │ Collectors   │
+                         └──────┬───────┘
+                                │
+                    ┌───────────┼────────────┐
+                    │           │            │
+                  Gateway      OTel       Network
+                    │           │            │
+                    └───────────┼────────────┘
+                                │
+                                ▼
+                         Runtime Events
+```
+
+### The key idea
+
+The **AI Estate Collector** should have two modes:
+
+**Discovery mode**
+
+> "Tell me what AI-related assets exist."
+
+**Observation mode**
+
+> "Tell me what those assets are actually doing."
+
+---
+
+# Collector Architecture
+
+I would avoid making one giant collector.
+
+Instead:
+
+```text
+ai-estate-collector
+│
+├── collectors/
+│   ├── kubernetes/
+│   ├── docker/
+│   ├── git/
+│   ├── github/
+│   ├── gitlab/
+│   ├── cloud/
+│   ├── sbom/
+│   ├── mcp/
+│   └── gateway/
+│
+├── detectors/
+│   ├── agent_detector
+│   ├── llm_detector
+│   ├── embedding_detector
+│   ├── reranker_detector
+│   ├── rag_detector
+│   ├── tool_detector
+│   └── framework_detector
+│
+├── observers/
+│   ├── otel
+│   ├── api_gateway
+│   ├── service_mesh
+│   └── network
+│
+├── normalizer/
+│
+├── relationship_engine/
+│
+└── publisher/
+```
+
+The **normalizer** is particularly important.
+
+For example, collectors might discover:
+
+```text
+Kubernetes:
+  env MODEL_NAME=gpt-x
+
+Git:
+  import openai
+
+SBOM:
+  openai==X.Y
+
+Gateway:
+  model=gpt-x
+```
+
+The normalizer turns all of this into one canonical asset:
+
+```text
+MODEL
+----------------------------
+Name: GPT-X
+Provider: OpenAI
+Type: LLM
+
+Evidence:
+  Kubernetes
+  Git
+  SBOM
+  Gateway
+```
+
+---
+
+# Evidence-based discovery
+
+I'd introduce an important concept called **Asset Evidence**.
+
+Instead of simply saying:
+
+```text
+Application A uses GPT-X
+```
+
+store:
+
+```text
+Application A
+     │
+     ▼
+Uses GPT-X
+     │
+     ├── Evidence: Kubernetes ENV
+     ├── Evidence: Git dependency
+     ├── Evidence: Gateway request
+     └── Evidence: OTel trace
+```
+
+Then assign a confidence:
+
+```text
+DISCOVERED
+OBSERVED
+VERIFIED
+```
+
+For example:
+
+```text
+GPT-X
+│
+├── Application A
+│      └── VERIFIED
+│
+├── Application B
+│      └── OBSERVED
+│
+└── Application C
+       └── DISCOVERED
+```
+
+This prevents your platform from confusing **configuration with actual usage**.
+
+---
+
+# Collector → Estate API
+
+I would make the Collector independent of your main platform.
+
+```text
+AI Estate Collector
+        │
+        │ HTTPS / gRPC
+        ▼
+┌─────────────────────┐
+│ Estate Ingestion API│
+└──────────┬──────────┘
+           │
+      Event Queue
+           │
+      ┌────▼─────┐
+      │Normalizer│
+      └────┬─────┘
+           │
+      ┌────▼──────────┐
+      │ Asset Resolver│
+      └────┬──────────┘
+           │
+      ┌────▼─────────┐
+      │ Asset Catalog │
+      └──────────────┘
+```
+
+This gives you a very clean enterprise deployment model.
+
+---
+
+# Deployment model
+
+This could be particularly attractive for enterprises because you don't necessarily need access to their source code or runtime data outside their environment.
+
+```text
+             CUSTOMER ENVIRONMENT
+┌──────────────────────────────────────────────┐
+│                                              │
+│ Kubernetes                                   │
+│ ┌──────────────────────────────────────────┐ │
+│ │ AI Estate Collector                     │ │
+│ │                                          │ │
+│ │ K8s │ SBOM │ Git │ OTel │ Gateway       │ │
+│ └──────────────────┬───────────────────────┘ │
+│                    │                          │
+└────────────────────┼─────────────────────────┘
+                     │
+                Secure Channel
+                     │
+                     ▼
+              AI ESTATE CLOUD
+                     │
+          ┌──────────┼──────────┐
+          ▼          ▼          ▼
+       Catalog    Analytics   Governance
+```
+
+For highly regulated customers, you could eventually support:
+
+```text
+Fully SaaS
+Private Collector
+Self-hosted
+Air-gapped
+```
+
+---
+
+# One thing I'd add to your DB design
+
+With this Collector concept, add:
+
+### `collector`
+
+```sql
+CREATE TABLE collector (
+    collector_id       UUID PRIMARY KEY,
+    tenant_id          UUID NOT NULL,
+    name               VARCHAR(255) NOT NULL,
+
+    collector_type     VARCHAR(100),
+    version            VARCHAR(50),
+
+    environment        VARCHAR(100),
+
+    status             VARCHAR(50),
+
+    last_heartbeat_at  TIMESTAMP,
+
+    created_at         TIMESTAMP NOT NULL,
+    updated_at         TIMESTAMP NOT NULL
+);
+```
+
+And:
+
+### `asset_evidence`
+
+```sql
+CREATE TABLE asset_evidence (
+    evidence_id        UUID PRIMARY KEY,
+
+    asset_id           UUID NOT NULL,
+
+    collector_id       UUID REFERENCES collector(collector_id),
+
+    evidence_type      VARCHAR(100),
+
+    source             VARCHAR(255),
+
+    source_identifier  VARCHAR(500),
+
+    observed_at        TIMESTAMP NOT NULL,
+
+    confidence          NUMERIC(5,4),
+
+    evidence_data      JSONB
+);
+```
+
+Now your architecture becomes:
+
+```text
+Collector
+    │
+    ▼
+Evidence
+    │
+    ▼
+Asset Resolution
+    │
+    ▼
+AI Asset
+    │
+    ▼
+Relationship
+    │
+    ▼
+Runtime Usage
+```
+
+That's a very clean data lineage.
+
+---
+
+## I would also define the Collector's contract early
+
+Something like:
+
+```json
+{
+  "collectorId": "collector-123",
+  "timestamp": "2026-09-18T10:00:00Z",
+  "source": "kubernetes",
+  "assets": [
+    {
+      "type": "MODEL",
+      "name": "gpt-x",
+      "provider": "openai",
+      "application": "contract-analyzer",
+      "environment": "production",
+      "evidence": {
+        "type": "environment_variable",
+        "key": "MODEL_NAME"
+      }
+    }
+  ]
+}
+```
+
+Then your Collector becomes a **pluggable discovery/observation agent** rather than being tightly coupled to your database.
+
+### A possible GitHub structure
+
+I'd actually consider:
+
+```text
+ai-estate/
+│
+├── ai-estate-collector/
+├── ai-estate-api/
+├── ai-estate-catalog/
+├── ai-estate-runtime/
+├── ai-estate-governance/
+├── ai-estate-ui/
+│
+├── docs/
+└── README.md
+```
+
+Or, for the initial POC:
+
+```text
+ai-estate-collector
+```
+
+with the Collector itself containing the first discovery plugins.
+
+**The architectural principle I'd lock down now is:**
+
+> **Collector discovers evidence → Estate resolves evidence into canonical assets → Runtime observes actual usage → Governance evaluates the resulting estate.**
+
+That gives you a strong foundation for the **Discover → Observe → Govern** vision.
